@@ -3114,6 +3114,13 @@ function micDetectLoop() {
         label.textContent  = `🎹 ${solfegeNames[idx]}  ${noteNames[idx]}`;
         label.classList.add('show');
       }
+      // Kirim ke logic game — sama persis seperti tap tuts manual
+      if (canClick) {
+        handleClick(idx);
+        // Reset stable agar tidak double-trigger sampai nada berikutnya
+        micStableCount = 0;
+        micStableIdx   = -1;
+      }
     }
   } else {
     // Tidak ada nada — reset stable counter, tahan highlight lalu hapus
