@@ -2970,138 +2970,155 @@ function toggleBgMusic() {
 }
 
 // ══════════════════════ PITCH DETECTION ENGINE ══════════════════════
-// Menggunakan autocorrelation (MPM-inspired) + threshold 70dB
+// Menggunakan YIN algorithm + AudioContext terpisah untuk mic
+// Threshold: RMS amplitude 0.015 (setara ~70dB akustik dari jarak wajar)
 // Mendeteksi nada piano F3-F4 dan highlight tuts tanpa trigger klik
 
-const MIC_DB_THRESHOLD = 70;    // minimum dB agar diproses
-const MIC_CONFIDENCE   = 0.88;  // minimum confidence autocorrelation
-const MIC_SMOOTH_MS    = 80;    // interval update deteksi (ms)
-const MIC_HOLD_MS      = 200;   // berapa lama highlight tuts tetap terlihat setelah suara hilang
+// CATATAN PENTING tentang "70dB":
+// Web Audio API menggunakan nilai float -1.0 sampai +1.0 (normalized amplitude).
+// dB akustik fisik ≠ dB dari RMS float buffer.
+// Kita pakai RMS threshold langsung: 0.015 ≈ sinyal cukup kuat tapi tidak berisik.
+const MIC_RMS_THRESHOLD = 0.015;  // minimum RMS amplitude (lebih rendah = lebih sensitif)
+const MIC_CONFIDENCE    = 0.70;   // minimum confidence YIN (diturunkan dari 0.88)
+const MIC_SMOOTH_MS     = 60;     // interval polling deteksi (ms)
+const MIC_HOLD_MS       = 350;    // highlight tahan X ms setelah suara hilang
 
-// Frekuensi referensi tiap tuts (F3-F4)
-// Urutan: F3=0, G3=1, A3=2, B3=3, C4=4, D4=5, E4=6, F4=7
+// Frekuensi referensi tiap tuts (F3–F4)
+// Index: F3=0, G3=1, A3=2, B3=3, C4=4, D4=5, E4=6, F4=7
 const MIC_KEY_FREQS = [174.61, 196.00, 220.00, 246.94, 261.63, 293.66, 329.63, 349.23];
+// Toleransi deteksi dalam cents per nada (1 semitone = 100 cents)
+const MIC_CENTS_TOLERANCE = 80;
 
-let micStream = null;
+let micStream   = null;
+let micAudioCtx = null;   // AudioContext TERPISAH khusus mic
 let micAnalyser = null;
-let micSource = null;
-let micActive = false;
-let micRafId = null;
-let micLastKeyIdx = -1;
-let micHoldTimer = null;
+let micSource   = null;
+let micActive   = false;
+let micRafId    = null;
+let micLastKeyIdx  = -1;
+let micHoldTimer   = null;
+let micStableCount = 0;   // berapa frame berturut-turut deteksi sama
+let micStableIdx   = -1;
 
-// Konversi amplitude RMS → dB
-function rmsToDb(rms) {
-  if (rms < 1e-10) return -Infinity;
-  return 20 * Math.log10(rms);
-}
+// ── YIN Pitch Detection ──────────────────────────────────────────
+// Lebih akurat dari autocorrelation biasa untuk nada piano/suara manusia
+// Referensi: de Cheveigné & Kawahara (2002)
+function detectPitchYIN(buffer, sampleRate) {
+  const N = buffer.length;
+  const W = Math.floor(N / 2);
 
-// Autocorrelation pitch detector
-// Kembalikan frekuensi terdeteksi atau -1 jika tidak yakin
-function detectPitch(buffer, sampleRate) {
-  const SIZE = buffer.length;
-  const MAX_SAMPLES = Math.floor(SIZE / 2);
-
-  // Hitung RMS dulu untuk cek threshold
+  // 1. Cek RMS threshold
   let rmsSum = 0;
-  for (let i = 0; i < SIZE; i++) rmsSum += buffer[i] * buffer[i];
-  const rms = Math.sqrt(rmsSum / SIZE);
-  const db = rmsToDb(rms);
-  if (db < MIC_DB_THRESHOLD) return -1;  // terlalu pelan, abaikan
+  for (let i = 0; i < N; i++) rmsSum += buffer[i] * buffer[i];
+  const rms = Math.sqrt(rmsSum / N);
+  if (rms < MIC_RMS_THRESHOLD) return -1;
 
-  // Autocorrelation
-  const corr = new Float32Array(MAX_SAMPLES);
-  for (let lag = 0; lag < MAX_SAMPLES; lag++) {
-    let sum = 0;
-    for (let i = 0; i < MAX_SAMPLES; i++) {
-      sum += buffer[i] * buffer[i + lag];
+  // 2. Difference function
+  const diff = new Float32Array(W);
+  for (let tau = 1; tau < W; tau++) {
+    let s = 0;
+    for (let j = 0; j < W; j++) {
+      const d = buffer[j] - buffer[j + tau];
+      s += d * d;
     }
-    corr[lag] = sum;
+    diff[tau] = s;
   }
 
-  // Cari peak pertama setelah dip awal (MPM step 1)
-  let d = 0;
-  while (d < MAX_SAMPLES && corr[d] > corr[d + 1]) d++;
-  let maxVal = -Infinity, maxLag = -1;
-  for (let i = d; i < MAX_SAMPLES; i++) {
-    if (corr[i] > maxVal) { maxVal = corr[i]; maxLag = i; }
+  // 3. Cumulative Mean Normalized Difference (CMND)
+  const cmnd = new Float32Array(W);
+  cmnd[0] = 1;
+  let runSum = 0;
+  for (let tau = 1; tau < W; tau++) {
+    runSum += diff[tau];
+    cmnd[tau] = runSum === 0 ? 0 : diff[tau] * tau / runSum;
   }
 
-  // Confidence check
-  if (corr[0] === 0) return -1;
-  const confidence = maxVal / corr[0];
-  if (confidence < MIC_CONFIDENCE) return -1;
+  // 4. Absolute threshold — cari tau minimum di bawah threshold
+  const YIN_THRESH = 1.0 - MIC_CONFIDENCE; // mis. confidence 0.70 → threshold 0.30
+  let tauEst = -1;
+  // Batasi pencarian ke range freq yang kita inginkan: 150–400 Hz
+  const tauMin = Math.floor(sampleRate / 400);
+  const tauMax = Math.ceil(sampleRate / 150);
+  for (let tau = Math.max(2, tauMin); tau < Math.min(W, tauMax); tau++) {
+    if (cmnd[tau] < YIN_THRESH) {
+      // Cari minimum lokal di sekitar ini
+      while (tau + 1 < W && cmnd[tau + 1] < cmnd[tau]) tau++;
+      tauEst = tau;
+      break;
+    }
+  }
+  if (tauEst < 2) return -1;
 
-  // Interpolasi parabola untuk akurasi subbin
-  if (maxLag <= 0 || maxLag >= MAX_SAMPLES - 1) return -1;
-  const y1 = corr[maxLag - 1], y2 = corr[maxLag], y3 = corr[maxLag + 1];
-  const denom = 2 * (2 * y2 - y1 - y3);
-  const refinedLag = denom !== 0 ? maxLag + (y3 - y1) / denom : maxLag;
+  // 5. Parabolic interpolation untuk akurasi subbin
+  const t0 = tauEst;
+  const t1 = Math.min(t0 - 1, 2), t2 = Math.min(t0 + 1, W - 1);
+  const s0 = cmnd[t1], s1 = cmnd[t0], s2 = cmnd[t2];
+  const denom = 2 * (2 * s1 - s0 - s2);
+  const refined = denom !== 0 ? t0 + (s2 - s0) / denom : t0;
+  if (refined <= 0) return -1;
 
-  return sampleRate / refinedLag;
+  return sampleRate / refined;
 }
 
-// Cari index tuts terdekat dari frekuensi (dalam range F3-F4)
-// Toleransi: ±semitone (sekitar 6%)
+// ── Frekuensi → index tuts ───────────────────────────────────────
 function freqToKeyIdx(freq) {
-  if (freq <= 0) return -1;
+  if (!freq || freq <= 0) return -1;
   let best = -1, bestCent = Infinity;
   for (let i = 0; i < MIC_KEY_FREQS.length; i++) {
-    // Jarak dalam cents (1 semitone = 100 cents)
     const cents = Math.abs(1200 * Math.log2(freq / MIC_KEY_FREQS[i]));
     if (cents < bestCent) { bestCent = cents; best = i; }
   }
-  // Toleransi ±70 cents (lebih dari semitone tapi bukan 2)
-  return bestCent <= 70 ? best : -1;
+  return bestCent <= MIC_CENTS_TOLERANCE ? best : -1;
 }
 
-// Highlight tuts di area piano (bukan trigger handleClick)
+// ── Highlight tuts ───────────────────────────────────────────────
 function highlightMicKey(idx) {
-  // Bersihkan semua highlight mic
   whiteKeys.forEach(k => k.classList.remove('mic-detected'));
-  if (idx < 0 || idx >= whiteKeys.length) {
-    micLastKeyIdx = -1;
-    return;
-  }
-  // Jangan highlight kalau tuts sedang dalam state game (active/hit/miss)
-  // kecuali tidak ada state — tetap tampilkan sebagai info saja
+  if (idx < 0 || idx >= whiteKeys.length) { micLastKeyIdx = -1; return; }
   whiteKeys[idx].classList.add('mic-detected');
   micLastKeyIdx = idx;
 }
-
 function clearMicHighlight() {
   whiteKeys.forEach(k => k.classList.remove('mic-detected'));
   micLastKeyIdx = -1;
 }
 
-// Loop deteksi mic
+// ── Loop deteksi ─────────────────────────────────────────────────
 function micDetectLoop() {
   if (!micActive || !micAnalyser) return;
 
   const bufLen = micAnalyser.fftSize;
-  const timeDomain = new Float32Array(bufLen);
-  micAnalyser.getFloatTimeDomainData(timeDomain);
+  const buf = new Float32Array(bufLen);
+  micAnalyser.getFloatTimeDomainData(buf);
 
-  const sampleRate = audioCtx.sampleRate;
-  const freq = detectPitch(timeDomain, sampleRate);
-  const idx = freqToKeyIdx(freq);
+  // Gunakan sampleRate dari micAudioCtx, bukan audioCtx game
+  const sr = micAudioCtx ? micAudioCtx.sampleRate : 44100;
+  const freq = detectPitchYIN(buf, sr);
+  const idx  = freqToKeyIdx(freq);
 
   if (idx >= 0) {
-    // Suara valid terdeteksi
+    // Suara valid — stabilisasi: tuntut 2 frame berturut-turut sebelum update
     if (micHoldTimer) { clearTimeout(micHoldTimer); micHoldTimer = null; }
-    if (idx !== micLastKeyIdx) {
+    if (idx === micStableIdx) {
+      micStableCount++;
+    } else {
+      micStableIdx  = idx;
+      micStableCount = 1;
+    }
+    if (micStableCount >= 2 && idx !== micLastKeyIdx) {
       highlightMicKey(idx);
-      // Update label status
       const label = document.getElementById('micStatusLabel');
       if (label) {
-        const names = ['Fa','Sol','La','Si','Do','Re','Mi','Fa'];
-        const noteNames = ['F3','G3','A3','B3','C4','D4','E4','F4'];
-        label.textContent = `🎹 ${names[idx]} (${noteNames[idx]})`;
+        const solfegeNames = ['Fa','Sol','La','Si','Do','Re','Mi','Fa'];
+        const noteNames    = ['F3','G3','A3','B3','C4','D4','E4','F4'];
+        label.textContent  = `🎹 ${solfegeNames[idx]}  ${noteNames[idx]}`;
         label.classList.add('show');
       }
     }
   } else {
-    // Tidak ada nada valid — tahan highlight selama MIC_HOLD_MS lalu hapus
+    // Tidak ada nada — reset stable counter, tahan highlight lalu hapus
+    micStableCount = 0;
+    micStableIdx   = -1;
     if (!micHoldTimer && micLastKeyIdx >= 0) {
       micHoldTimer = setTimeout(() => {
         clearMicHighlight();
@@ -3115,23 +3132,41 @@ function micDetectLoop() {
   micRafId = setTimeout(micDetectLoop, MIC_SMOOTH_MS);
 }
 
+// ── Start / Stop Mic ─────────────────────────────────────────────
 async function startMic() {
   try {
-    // Resume AudioContext dulu
-    resumeAudio();
-    micStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
-    micSource = audioCtx.createMediaStreamSource(micStream);
-    micAnalyser = audioCtx.createAnalyser();
-    micAnalyser.fftSize = 2048;
-    micAnalyser.smoothingTimeConstant = 0.1;
-    micSource.connect(micAnalyser);
-    // Tidak connect ke destination — tidak ada echo suara mic
+    // Buat AudioContext TERPISAH untuk mic agar tidak konflik dengan game audio
+    if (!micAudioCtx) {
+      micAudioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 44100 });
+    }
+    if (micAudioCtx.state === 'suspended') await micAudioCtx.resume();
 
-    micActive = true;
+    const constraints = {
+      audio: {
+        echoCancellation: false,  // matikan: bisa mengacaukan deteksi nada piano
+        noiseSuppression: false,  // matikan: noise suppression memotong sustain piano
+        autoGainControl:  false,  // matikan: gain stabil = threshold lebih prediktabel
+        channelCount: 1
+      },
+      video: false
+    };
+    micStream = await navigator.mediaDevices.getUserMedia(constraints);
+    micSource  = micAudioCtx.createMediaStreamSource(micStream);
+    micAnalyser = micAudioCtx.createAnalyser();
+    micAnalyser.fftSize = 4096;         // lebih besar = lebih akurat untuk nada rendah
+    micAnalyser.smoothingTimeConstant = 0.0;  // no smoothing — kita mau sinyal mentah
+    micSource.connect(micAnalyser);
+    // TIDAK connect ke destination → tidak ada echo
+
+    micActive      = true;
+    micLastKeyIdx  = -1;
+    micStableCount = 0;
+    micStableIdx   = -1;
+
     const btn = document.getElementById('micBtn');
     if (btn) { btn.textContent = '🔴'; btn.classList.add('mic-active'); }
     const label = document.getElementById('micStatusLabel');
-    if (label) { label.textContent = '🎤 Mendengarkan piano...'; label.classList.add('show'); }
+    if (label) { label.textContent = '🎤 Mendengarkan...'; label.classList.add('show'); }
     setTimeout(() => {
       const l2 = document.getElementById('micStatusLabel');
       if (l2 && l2.textContent.includes('Mendengarkan')) l2.classList.remove('show');
@@ -3139,23 +3174,29 @@ async function startMic() {
 
     micDetectLoop();
   } catch (err) {
-    console.warn('Mic error:', err);
+    console.warn('Mic error:', err.name, err.message);
     const label = document.getElementById('micStatusLabel');
     if (label) {
-      label.textContent = '❌ Akses mikrofon ditolak';
+      label.textContent = err.name === 'NotAllowedError'
+        ? '❌ Izin mikrofon ditolak'
+        : '❌ Mikrofon tidak tersedia';
       label.classList.add('show');
-      setTimeout(() => label.classList.remove('show'), 3000);
+      setTimeout(() => label.classList.remove('show'), 4000);
     }
   }
 }
 
 function stopMic() {
   micActive = false;
-  if (micRafId) { clearTimeout(micRafId); micRafId = null; }
-  if (micHoldTimer) { clearTimeout(micHoldTimer); micHoldTimer = null; }
-  if (micSource) { try { micSource.disconnect(); } catch(e){} micSource = null; }
-  if (micStream) { micStream.getTracks().forEach(t => t.stop()); micStream = null; }
-  micAnalyser = null;
+  if (micRafId)    { clearTimeout(micRafId); micRafId = null; }
+  if (micHoldTimer){ clearTimeout(micHoldTimer); micHoldTimer = null; }
+  if (micSource)   { try { micSource.disconnect(); } catch(e){} micSource = null; }
+  if (micStream)   { micStream.getTracks().forEach(t => t.stop()); micStream = null; }
+  if (micAudioCtx) { try { micAudioCtx.close(); } catch(e){} micAudioCtx = null; }
+  micAnalyser    = null;
+  micLastKeyIdx  = -1;
+  micStableCount = 0;
+  micStableIdx   = -1;
   clearMicHighlight();
   const btn = document.getElementById('micBtn');
   if (btn) { btn.textContent = '🎤'; btn.classList.remove('mic-active'); }
