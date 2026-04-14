@@ -2999,6 +2999,7 @@ let micLastKeyIdx  = -1;
 let micHoldTimer   = null;
 let micStableCount = 0;   // berapa frame berturut-turut deteksi sama
 let micStableIdx   = -1;
+let micCooldown    = false; // blokir deteksi selama cooldown setelah trigger
 
 // ── YIN Pitch Detection ──────────────────────────────────────────
 // Lebih akurat dari autocorrelation biasa untuk nada piano/suara manusia
@@ -3115,11 +3116,14 @@ function micDetectLoop() {
         label.classList.add('show');
       }
       // Kirim ke logic game — sama persis seperti tap tuts manual
-      if (canClick) {
+      if (canClick && !micCooldown) {
+        micCooldown = true;
         handleClick(idx);
         // Reset stable agar tidak double-trigger sampai nada berikutnya
         micStableCount = 0;
         micStableIdx   = -1;
+        // Cooldown 1300ms — lebih panjang dari delay game (900ms) + sustain piano
+        setTimeout(() => { micCooldown = false; }, 1300);
       }
     }
   } else {
@@ -3204,6 +3208,7 @@ function stopMic() {
   micLastKeyIdx  = -1;
   micStableCount = 0;
   micStableIdx   = -1;
+  micCooldown    = false;
   clearMicHighlight();
   const btn = document.getElementById('micBtn');
   if (btn) { btn.textContent = '🎤'; btn.classList.remove('mic-active'); }
